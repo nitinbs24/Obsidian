@@ -1,4 +1,4 @@
-# Obsidian — Object Storage Search Engine
+# Obsidian — Object Storage Index and Navigation
 
 Each top-level directory maps to an ownership role; files are placed where they logically belong and may evolve as the project matures.
 
