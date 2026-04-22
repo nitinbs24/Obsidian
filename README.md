@@ -140,6 +140,3 @@ Artefacts that are referenced by multiple services. Changes here require consens
 | `roles.md` | Ownership map — which person/role owns which files and directories. |
 
 ---
-# 2. Follow the setup guide for remaining steps
-cat docs/setup.md
-```
