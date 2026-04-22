@@ -1,6 +1,6 @@
 # Obsidian — Object Storage Search Engine
 
-A search engine for object storage, built by a five-person team. Each top-level directory maps to an ownership role; files are placed where they logically belong and may evolve as the project matures.
+Each top-level directory maps to an ownership role; files are placed where they logically belong and may evolve as the project matures.
 
 ---
 
@@ -140,13 +140,6 @@ Artefacts that are referenced by multiple services. Changes here require consens
 | `roles.md` | Ownership map — which person/role owns which files and directories. |
 
 ---
-
-## Quick Start
-
-```bash
-# 1. Start all backing services
-docker compose -f infrastructure/docker-compose.yml up -d
-
 # 2. Follow the setup guide for remaining steps
 cat docs/setup.md
 ```
