@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  tika:
+    image: apache/tika:3.1.0
+    container_name: obsidian-tika
+    ports:
+      - "9998:9998"
+    environment:
+      # Max heap for Tika JVM — increase if processing large PDFs
+      - TIKA_JAVA_OPTS=-Xmx1g
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9998/tika"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
