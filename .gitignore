@@ -1,1 +1,17 @@
+# Environments
+.env
+.venv
 .venv/
+venv/
+ENV/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDEs
+.vscode/
+.idea/
