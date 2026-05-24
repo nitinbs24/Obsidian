@@ -1,0 +1,8 @@
+# Search Database Administrator dependencies
+# Owner: Priyadarshini Sarja
+
+opensearch-py==2.6.0
+redis==5.0.4
+python-dotenv==1.0.1
+pytest==8.2.0
+pytest-asyncio==0.23.6

@@ -1,142 +1,326 @@
-# Obsidian — Object Storage Index and Navigation
+# Obsidian — Search Database & Cache Layer
 
-Each top-level directory maps to an ownership role; files are placed where they logically belong and may evolve as the project matures.
+A hybrid search engine that indexes uploaded files into OpenSearch and caches
+results in Redis — built for the HPE Campus Connect Program.
 
 ---
 
-## Repository Structure
+## What This Role Does
+
+1. Files uploaded to MinIO are ingested by the ingestion worker, which calls
+   **my OpenSearch client** to upsert text chunks and vector embeddings into the search index
+2. When a user searches, the Go API Gateway checks **my Redis cache** first —
+   if it's a hit, results are returned in under 1 ms without touching OpenSearch
+3. On a cache miss, **my hybrid search query** runs BM25 + vector search in parallel
+   on OpenSearch, returns ranked results, and stores them in Redis for next time
+
+---
+
+## Tech Stack
+
+| Tool | What it does | Why we chose it |
+|------|-------------|-----------------|
+| OpenSearch | Stores file chunks, metadata, and 384-dim vector embeddings | Free, open source, supports hybrid BM25 + kNN search |
+| OpenSearch Neural Search Plugin | Combines BM25 and vector scores into one ranked result | Built into OpenSearch, no extra service needed |
+| OpenSearch Dashboards | Web UI to inspect the search index | Free, built into OpenSearch |
+| Redis | In-memory cache for search results with TTL | Sub-millisecond reads, LRU eviction, zero persistence overhead |
+| Python (opensearch_client) | Upserts chunks and embeddings into OpenSearch | Used by Nithin & Praneeth's ingestion worker |
+| Python (redis_cache) | Stores and retrieves cached search results | Plugs into the Go API Gateway cache check |
+
+---
+
+## Role Structure
 
 ```
 Obsidian/
 ├── infrastructure/
+│   ├── opensearch/
+│   │   ├── docker-compose.yml       # Runs OpenSearch + Dashboards
+│   │   ├── index-mapping.json       # Schema: vector field, metadata, BM25 fields
+│   │   └── hybrid-plugin-setup.sh  # One-shot: creates index + hybrid pipeline
+│   └── redis/
+│       ├── docker-compose.yml       # Runs Redis container
+│       └── redis.conf               # 256MB cap, LRU eviction, no persistence
 ├── workers/
+│   └── ingestion/
+│       └── opensearch_client.py     # Called by ingestion worker to upsert chunks
 ├── backend/
-├── frontend/
-├── shared/
-└── docs/
+│   ├── search/
+│   │   └── opensearch_query_builder.py  # Hybrid BM25+kNN query (source of truth for Go)
+│   └── cache/
+│       └── redis_cache.py           # Step 4: stores search results after OpenSearch returns
+├── tests/
+│   └── test_opensearch.py           # Unit + integration tests for all components
+├── requirements.txt
+└── .env.example
 ```
 
 ---
 
-## `infrastructure/` — Infrastructure & Messaging
+## Prerequisites
 
-Everything needed to stand up the backing services locally (MinIO, Kafka, Redis, OpenSearch). A root-level `docker-compose.yml` orchestrates the full stack; each sub-directory contains service-specific configuration.
+```bash
+# 1. Docker Desktop
+# Download: https://www.docker.com/products/docker-desktop/
+docker --version
 
-| Path | Description |
-|------|-------------|
-| `minio/config.env` | Environment variables for the MinIO instance (access keys, region, port). |
-| `minio/setup.sh` | Bucket creation and event-notification configuration so MinIO publishes upload events to Kafka. |
-| `kafka/docker-compose.yml` | Compose file for the Kafka broker and Zookeeper. |
-| `kafka/topics.sh` | Script that creates the required topics and configures partition counts. |
-| `kafka/dead-letter/dlq-consumer.py` | A lightweight consumer that drains the dead-letter queue and logs failed messages for inspection. |
-| `redis/redis.conf` | Redis configuration (max memory, eviction policy, persistence settings). |
-| `opensearch/docker-compose.yml` | Compose file for the OpenSearch cluster. |
-| `opensearch/index-mapping.json` | Index mapping that defines the vector field, keyword fields, and metadata schema. |
-| `opensearch/hybrid-plugin-setup.sh` | Script that enables and configures the Neural Search plugin for hybrid retrieval. |
-| `docker-compose.yml` | **Root compose file** — spins up the entire backing stack (MinIO + Kafka + Redis + OpenSearch) in one command. |
+# 2. Python 3.10+
+# Download: https://www.python.org/downloads/
+# On Windows installer: tick "Add python.exe to PATH"
+python --version
 
----
+# 3. On Windows — run ONCE in Administrator PowerShell (or OpenSearch crashes)
+wsl -d docker-desktop sysctl -w vm.max_map_count=262144
 
-## `workers/` — Python Workers
-
-Three independently deployable Python services that handle embedding, ingestion, and search.
-
-### `workers/model-server/` — Embedding Model Server
-
-A single, centralised FastAPI service that exposes embedding endpoints. Both the ingestion worker and the search worker call into this server, so embedding models are loaded exactly once.
-
-| Path | Description |
-|------|-------------|
-| `main.py` | Application entrypoint; starts the FastAPI server. |
-| `text_embedder.py` | Wraps SentenceTransformers (`all-MiniLM-L6-v2`) for text embedding. |
-| `image_embedder.py` | Wraps CLIP / `nomic-embed-vision` for image embedding. |
-| `server.py` | FastAPI app defining `/embed/text` and `/embed/image` routes. |
-| `model_spec.json` | Single source of truth for model names, versions, and dimensions. |
-| `requirements.txt` | Python dependencies (includes ML libraries). |
-| `load-balancer/nginx.conf` | Nginx configuration for routing across model-server replicas at scale. |
-
-### `workers/ingestion/` — Ingestion Worker
-
-Consumes Kafka events triggered by file uploads, extracts text, chunks it, obtains embeddings from the model server, and upserts everything into OpenSearch.
-
-| Path | Description |
-|------|-------------|
-| `main.py` | Kafka consumer entrypoint; listens for new-object events. |
-| `tika_extractor.py` | Uses Apache Tika to extract text from PDF, DOCX, PPTX, and TXT files. |
-| `image_handler.py` | Preprocessing pipeline for JPEG/PNG files before they are sent for embedding. |
-| `chunker.py` | LangChain-based text chunking with configurable overlap. |
-| `model_client.py` | HTTP client that calls the model server's `/embed/*` endpoints. |
-| `opensearch_client.py` | Upserts vectors and metadata into OpenSearch. |
-| `requirements.txt` | Python dependencies — no ML/embedding libs; the model server handles those. |
-
-### `workers/search/` — Search Worker
-
-A gRPC service that receives a raw query string, parses intent, vectorises the query via the model server, and returns it ready for hybrid retrieval.
-
-| Path | Description |
-|------|-------------|
-| `main.py` | gRPC server entrypoint. |
-| `nlp_parser.py` | Parses intent, filters, and keywords from a raw query string. |
-| `model_client.py` | HTTP client calling the model server (same interface as the ingestion worker). |
-| `grpc/search.proto` | Protobuf definition — symlinked from `shared/proto/`. |
-| `grpc/search_pb2.py` | Auto-generated Python bindings from the proto file. |
-| `grpc/search_pb2_grpc.py` | Auto-generated gRPC service stubs. |
-| `requirements.txt` | Python dependencies — no ML/embedding libs. |
+# To make it permanent, add to %USERPROFILE%\.wslconfig:
+# [wsl2]
+# kernelCommandLine = sysctl.vm.max_map_count=262144
+```
 
 ---
 
-## `backend/` — Go API Server
+## Setup (First Time Only)
 
-The central orchestration layer. Accepts HTTP requests from the frontend, checks the Redis cache, fans out to OpenSearch and the search worker, and assembles the response.
+### 1. Clone the repo
 
-| Path | Description |
-|------|-------------|
-| `main.go` | Application entrypoint. |
-| `go.mod` | Go module definition and dependency list. |
-| `api/routes.go` | HTTP route definitions (`/search`, `/health`, etc.). |
-| `cache/redis.go` | Query normalisation, hashing, and TTL-based caching logic. |
-| `search/opensearch.go` | Builds and executes hybrid BM25 + vector queries via the Neural Search plugin. |
-| `grpc/client.go` | gRPC client that calls the search worker for query vectorisation. |
-| `config/config.go` | Centralised configuration loading (env vars, defaults). |
+```bash
+git clone https://github.com/your-org/Obsidian
+cd Obsidian
+```
+
+### 2. Create your .env file
+
+```bash
+cp .env.example .env
+# Defaults work for local. Update HOST values if running on a server.
+```
+
+### 3. Install Python dependencies
+
+```bash
+# Linux/Mac:
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Windows:
+python -m venv .venv
+.venv\Scripts\activate
+
+pip install -r requirements.txt
+```
+
+### 4. Start Redis
+
+```bash
+cd infrastructure/redis
+docker compose up -d
+```
+
+### 5. Start OpenSearch
+
+```bash
+cd infrastructure/opensearch
+docker compose up -d
+# Takes 30-60 seconds — wait until healthy
+docker logs -f opensearch-node1
+# Ready when you see: Cluster health status changed from [RED] to [GREEN]
+```
+
+### 6. Create index and hybrid pipeline (run once only)
+
+```bash
+cd infrastructure/opensearch
+chmod +x hybrid-plugin-setup.sh       # Linux/Mac only
+./hybrid-plugin-setup.sh
+
+# You should see:
+# [+] Cluster is green/yellow
+# [+] Creating hybrid search pipeline: obsidian-hybrid-pipeline
+# [+] Creating index 'obsidian-files'
+# [+] ✅ OpenSearch hybrid search setup complete
+```
 
 ---
 
-## `frontend/` — Next.js UI
+## Verify Everything is Running
 
-A Next.js application providing the search interface. Communicates exclusively with the Go backend.
+```bash
+# OpenSearch cluster health
+curl http://localhost:9200/_cluster/health
 
-| Path | Description |
-|------|-------------|
-| `app/page.tsx` | Search landing page. |
-| `app/results/page.tsx` | Results page displaying ranked matches. |
-| `app/layout.tsx` | Root layout (shared header, metadata, providers). |
-| `components/SearchBar.tsx` | Debounced search input that calls the Go API. |
-| `components/ResultCard.tsx` | Displays a single result — filename, text snippet, download link. |
-| `components/FilterSidebar.tsx` | Faceted filters that map to OpenSearch filter parameters. |
-| `components/UploadStatus.tsx` | Polls the Go API to show real-time ingestion progress. |
-| `lib/api.ts` | Centralised HTTP client for all calls to the Go backend. |
-| `package.json` | Node dependencies and scripts. |
-| `next.config.ts` | Next.js configuration. |
+# Index exists with correct mapping
+curl http://localhost:9200/obsidian-files/_mapping
 
----
+# Hybrid pipeline attached
+curl http://localhost:9200/_search/pipeline/obsidian-hybrid-pipeline
 
-## `shared/` — Cross-Team Contracts
-
-Artefacts that are referenced by multiple services. Changes here require consensus across the team.
-
-| Path | Description |
-|------|-------------|
-| `proto/search.proto` | The single source of truth for the gRPC contract between the Go backend and the search worker. |
-| `model_spec.json` | Symlink to `workers/model-server/model_spec.json` — keeps model metadata in sync across services. |
+# Redis is alive
+docker exec obsidian-redis redis-cli ping
+# Should reply: PONG
+```
 
 ---
 
-## `docs/` — Documentation
+## Accessing the Services
 
-| Path | Description |
-|------|-------------|
-| `architecture.md` | High-level architecture diagram and data-flow explanation. |
-| `setup.md` | One-command local stack setup guide. |
-| `roles.md` | Ownership map — which person/role owns which files and directories. |
+| Service | URL |
+|---------|-----|
+| OpenSearch API | `http://localhost:9200` |
+| OpenSearch Dashboards | `http://localhost:5601` |
+| Redis | `localhost:6379` |
 
 ---
+
+## Running Tests
+
+```bash
+# Unit tests — no containers needed, runs instantly
+pytest tests/test_opensearch.py -v -m unit
+
+# Integration tests — needs OpenSearch + Redis running
+pytest tests/test_opensearch.py -v -m integration
+
+# All tests
+pytest tests/test_opensearch.py -v
+```
+
+---
+
+## How Other Roles Use My Code
+
+### Nithin & Praneeth (Ingestion Worker)
+
+Import and call the OpenSearch client to upsert chunks after embedding:
+
+```python
+from workers.ingestion.opensearch_client import get_client, ChunkDocument
+
+client = get_client()
+client.bulk_upsert([
+    ChunkDocument(
+        object_key  = "bucket/reports/fire_safety.pdf",
+        bucket      = "hpe-objects",
+        filename    = "fire_safety.pdf",
+        extension   = "pdf",
+        mime_type   = "application/pdf",
+        download_url= "http://minio:9000/bucket/reports/fire_safety.pdf",
+        owner       = "alice",
+        size_bytes  = 204800,
+        uploaded_at = "2024-11-01T10:00:00Z",
+        chunk_index = 0,
+        chunk_total = 3,
+        chunk_text  = "Fire safety protocols require regular drills.",
+        embedding   = [0.1, 0.2, ...],   # 384 floats from all-MiniLM-L6-v2
+        tags        = ["safety", "compliance"],
+    )
+])
+```
+
+### Prarthana (Go API Gateway)
+
+The hybrid query JSON structure is defined in `opensearch_query_builder.py` —
+replicate it exactly in `backend/search/opensearch.go`.
+
+The Redis cache key format she must match in `backend/cache/redis.go`:
+
+```
+obsidian:search:result:<SHA-256 of canonical JSON>
+```
+
+Canonical JSON example:
+
+```json
+{"bucket":"","date_from":"","date_to":"","extension":"pdf","from":0,"owner":"","q":"fire safety","size":10,"tags":[]}
+```
+
+SHA-256 that, take the first 32 hex characters, prepend `obsidian:search:result:`.
+
+---
+
+## Environment Variables
+
+Copy `.env.example` to `.env`. Never push `.env` to GitHub.
+
+```
+# OpenSearch
+OPENSEARCH_HOST=localhost
+OPENSEARCH_PORT=9200
+OPENSEARCH_INDEX=obsidian-files
+
+# Redis
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_PASSWORD=
+
+# TTL (seconds)
+REDIS_TTL_DEFAULT=300
+REDIS_TTL_FILTERED=600
+REDIS_TTL_POPULAR=1800
+REDIS_POPULAR_THRESHOLD=10
+
+# Search tuning
+SEARCH_KNN_K=50
+SEARCH_BM25_BOOST=0.4
+SEARCH_KNN_BOOST=0.6
+SEARCH_DEFAULT_SIZE=10
+```
+
+---
+
+## Redis TTL Strategy
+
+| Query type | TTL | Reason |
+|------------|-----|--------|
+| General query | 5 min | Results may change as files are uploaded |
+| Filtered query (extension / bucket / owner) | 10 min | More specific → more stable |
+| Popular query (10+ hits) | 30 min | Auto-promoted to save the most compute |
+
+---
+
+## Troubleshooting
+
+**OpenSearch not starting?**
+```bash
+docker logs opensearch-node1 --tail 30
+# Most common cause on Windows: vm.max_map_count too low
+# Fix: wsl -d docker-desktop sysctl -w vm.max_map_count=262144
+```
+
+**Index already exists on setup script?**
+```bash
+# Safe to ignore — your index is already there
+# To recreate from scratch:
+curl -X DELETE http://localhost:9200/obsidian-files
+./hybrid-plugin-setup.sh
+```
+
+**Redis connection refused?**
+```bash
+docker ps | grep redis
+# If not running:
+cd infrastructure/redis && docker compose up -d
+```
+
+**Python module not found?**
+```bash
+# Make sure virtualenv is activated
+.venv\Scripts\activate       # Windows
+source .venv/bin/activate    # Linux/Mac
+pip install -r requirements.txt
+```
+
+**Embeddings dimension mismatch on upsert?**
+```bash
+# Embedding must be exactly 384 floats (all-MiniLM-L6-v2 output)
+# Check model_spec.json in workers/model-server/
+```
+
+---
+
+## Stopping Services
+
+```bash
+cd infrastructure/opensearch && docker compose down
+cd infrastructure/redis      && docker compose down
+```
